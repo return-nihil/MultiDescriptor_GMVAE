@@ -1,0 +1,87 @@
+# MultiDescriptor_GMVAE config file
+
+device: "cuda:0"
+
+dataset_preprocessing:
+  orig_dataset_folder: "/mnt/volDISI_conci_Datasets/audio/TinySOL2020"
+  target_dataset_folder: "/mnt/volDISI_conci_Datasets/audio/TinySOL2020_GMVAE"
+  max_dur: 5.94 # this for 256x256 mel spectrograms
+  dur_quant: 250
+  sr: 22050
+  n_fft: 2048
+  hop_length: 512
+  n_mels: 256
+
+latent_dims: 
+  timbre: 8
+  pitch: 4
+  velocity: 4
+  duration: 4
+
+feature_extractor:
+  conv1: {out_channels: 32, kernel_size: 3, stride: 2, padding: 1, activation: leaky_relu}
+  conv2a: {out_channels: 64, kernel_size: 3, stride: 2, padding: 1, activation: leaky_relu}
+  conv2b: {out_channels: 64, kernel_size: 3, stride: 2, padding: 2, dilation: 2, dropout: 0.1, activation: leaky_relu}
+  post_concat:
+    - {out_channels: 256, kernel_size: 3, stride: 2, padding: 1, dropout: 0.1, activation: leaky_relu}
+    - {out_channels: 512, kernel_size: 3, stride: 1, padding: 1, activation: tanh}
+
+subencoders:
+  timbre:
+    - {out_channels: 256, kernel_size: 3, stride: 2, padding: 1, activation: leaky_relu, dropout: 0.2}
+    - {out_channels: 128, kernel_size: 3, stride: 2, padding: 1, activation: silu}
+    - {out_channels: 64, kernel_size: 3, stride: 1, padding: 1, activation: silu}
+    - {out_channels: 32, kernel_size: 3, stride: 1, padding: 1, activation: silu}
+  pitch:
+    - {out_channels: 256, kernel_size: [2, 5], stride: [2, 4], padding: [0, 1], activation: relu, dropout: 0.2}
+    - {out_channels: 128, kernel_size: [2, 4], stride: [2, 4], padding: [0, 1], activation: silu}
+    - {out_channels: 64, kernel_size: 3, stride: 1, padding: 1, activation: silu}
+    - {out_channels: 32, kernel_size: 3, stride: 1, padding: 1, activation: silu}
+  velocity:
+    - {out_channels: 256, kernel_size: [5, 2], stride: [4, 2], padding: [1, 0], activation: relu, dropout: 0.2}
+    - {out_channels: 128, kernel_size: [4, 2], stride: [4, 2], padding: [1, 0], activation: silu}
+    - {out_channels: 64, kernel_size: 3, stride: 1, padding: 1, activation: silu}
+    - {out_channels: 32, kernel_size: 3, stride: 1, padding: 1, activation: silu}
+  duration:
+    - {out_channels: 256, kernel_size: [5, 2], stride: [4, 2], padding: [1, 0], activation: relu, dropout: 0.2}
+    - {out_channels: 128, kernel_size: [4, 2], stride: [4, 2], padding: [1, 0], activation: silu}
+    - {out_channels: 64, kernel_size: 3, stride: 1, padding: 1, activation: silu}
+    - {out_channels: 32, kernel_size: 3, stride: 1, padding: 1, activation: silu}
+
+latent_inputs: # bad workaround, should be calculated automatically
+  timbre: 2048 
+  pitch: 512
+  velocity: 512 
+  duration: 512
+
+decoder:
+  upconvs:
+    - {out_channels: 256, kernel_size: 3, stride: 2, padding: 1, output_padding: 1, activation: silu, residual_blocks: 1}
+    - {out_channels: 128, kernel_size: 3, stride: 2, padding: 1, output_padding: 1, activation: silu, residual_blocks: 0}
+    - {out_channels: 64, kernel_size: 3, stride: 2, padding: 1, output_padding: 1, activation: silu, residual_blocks: 1}
+    - {out_channels: 32, kernel_size: 3, stride: 2, padding: 1, output_padding: 1, activation: tanh, residual_blocks: 0}
+    - {out_channels: 16, kernel_size: 3, stride: 2, padding: 1, output_padding: 1, activation: silu, residual_blocks: 1}
+    - {out_channels: 8, kernel_size: 3, stride: 2, padding: 1, output_padding: 1, activation: silu, residual_blocks: 0}
+    - {out_channels: 1, kernel_size: 3, stride: 1, padding: 1, output_padding: 0, activation: null, residual_blocks: 0}
+
+multidescriptor_gmvae:
+  logvar_init:
+    timbre: 0.0
+    pitch: -2.0
+    velocity: -2.0
+    duration: -2.0
+  logvar_trainable: false
+
+train:
+  batch_size: 32
+  num_epochs: 1000
+  learning_rate: 1e-4
+  weight_decay: 1e-5
+  warmup_steps: 1000
+  warmup_lr: 1e-6
+  scheduler:
+    name: "CosineAnnealingLR"
+    T_max: 1000
+    eta_min: 1e-6
+    last_epoch: -1
+    verbose: true

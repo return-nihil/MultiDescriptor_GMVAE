@@ -20,7 +20,7 @@ class Remover(nn.Module):
     '''Remove module for adversarial disentanglement of the latent space'''
     def __init__(self, input_dim, n_classes):
         super(Remover, self).__init__()
-        self.ney = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(input_dim, 128),
             nn.LeakyReLU(),
             nn.Linear(128, 64),

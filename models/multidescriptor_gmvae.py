@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import einops
     
-from blocks import ConvBlock2D, UpConvBlock2D, ResBlock2D, LatentSpace
+from models.blocks import ConvBlock2D, UpConvBlock2D, ResBlock2D, LatentSpace
 from utils import get_subconfig
 
 
