@@ -1,16 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import einops
-
-
-def xavier_init(model):
-    if isinstance(model, nn.Linear):
-        nn.init.xavier_uniform_(model.weight)
-        
-def kaiming_init(model):
-    if isinstance(model, nn.Linear):
-        nn.init.kaiming_uniform_(model.weight)        
 
 
 class ConvBlock2D(nn.Module):
@@ -53,12 +42,12 @@ class LatentSpace(nn.Module):
                  weigth=1):
         super(LatentSpace, self).__init__()
         self.linear_block = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.BatchNorm1d(512),
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
             nn.SiLU()
         )
-        self.fc_mu = nn.Linear(512, latent_dim)
-        self.fc_logvar = nn.Linear(512, latent_dim)
+        self.fc_mu = nn.Linear(128, latent_dim)
+        self.fc_logvar = nn.Linear(128, latent_dim)
         self.weigth = weigth
     
     def _reparametrization_trick(self, mu, logvar, weight):
@@ -72,7 +61,10 @@ class LatentSpace(nn.Module):
         mu = self.fc_mu(x)
         logvar = self.fc_logvar(x)
         z = torch.tanh(self._reparametrization_trick(mu, logvar, self.weigth))
-        return mu, logvar, z
+        return {'mu': mu, 
+                'logvar': logvar, 
+                'z': z
+                }
     
     
 class UpConvBlock2D(nn.Module):
@@ -108,6 +100,7 @@ class UpConvBlock2D(nn.Module):
     
 
 class ResBlock2D(nn.Module):
+    '''Residual block with optional dropout and activation function'''
     def __init__(
         self,
         channels,
