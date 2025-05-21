@@ -36,7 +36,7 @@ class TinySol_Dataset(Dataset):
         pitch = torch.tensor(self.dataframe.iloc[idx, 2] - self.min_pitch)
         velocity = torch.tensor(self.dataframe.iloc[idx, 3])
         duration = torch.tensor(self.dataframe.iloc[idx, 4])
-        spectrogram = torch.from_numpy(np.load(path)).unsqueeze(0).float()
+        spectrogram = (torch.from_numpy(np.load(path)).unsqueeze(0).float() + 80)/80
         
         return spectrogram, timbre, pitch, velocity, duration
 
@@ -71,4 +71,7 @@ if __name__ == '__main__':
     print(f'Pitch labels: {dataset.pitch_labels}')
     print(f'Velocity labels: {dataset.velocity_labels}')
     print(f'Duration labels: {dataset.duration_labels}')
+
+    print(min(sample[0]))
+    print(max(sample[0]))
 
