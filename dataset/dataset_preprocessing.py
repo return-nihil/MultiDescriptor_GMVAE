@@ -143,7 +143,7 @@ def process():
 
     with open(os.path.join(script_dir, 'class_mappings.json'), 'w') as f:
         json.dump({
-            'instrument_dict': instrument_dict,
+            'timbre_dict': instrument_dict,
             'velocity_dict': velocity_dict,
             'duration_dict': duration_dict
         }, f, indent=2)
