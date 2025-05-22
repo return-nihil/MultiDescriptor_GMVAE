@@ -1,15 +1,13 @@
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+thisdir = os.path.dirname(os.path.abspath(__file__))
 
 import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import wandb
-import torch.nn.functional as F
-import datetime
 
 from torch.utils.data import DataLoader, random_split
 from torch.optim import Adam
@@ -17,120 +15,92 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-
 from losses import *
 from utils import EarlyStopping
 from models.classifiers import Classifier, Remover
 from models.multidescriptor_gmvae import MultiDescriptorGMVAE
 from dataset.dataset import TinySol_Dataset
 
-#from src.utils.utils import plot_confusion_matrix
-
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 from utils import get_subconfig, xavier_init, kaiming_init
+from plotters import log_spectrograms, plot_confusion_matrix, plot_latent_space
 
-# Get the current date and time for the wandb run name and the model checkpoints
-now = datetime.datetime.now()
-DT_STRING = now.strftime("%d-%m-%Y_%H-%M-%S")
-
-# PATHS
-CHECKPOINT_PATH = f'runs/{DT_STRING}/checkpoints'
-MODELPATH = f'runs/{DT_STRING}/checkpoints/multidescriptor_GMVAE_{DT_STRING}.pth'
-CLASSIFIER_BESTLOSS = f'runs/{DT_STRING}/checkpoints/classifiers_bestloss_{DT_STRING}.pth'
-CLASSIFIER_PATH = f'runs/{DT_STRING}/checkpoints/classifiers_{DT_STRING}.pth'
-
-# CONFUSION MATRIX
-CONFUSION_PATH = f'runs/{DT_STRING}/confusion_matrix'
-DATAFRAME = 'dataset/dataframes/tinysol_dataframe_numpy.csv'
 
 data_config = get_subconfig('data')
 train_config = get_subconfig('train')
 device = get_subconfig('device')
+OUTPUT_FOLDER = get_subconfig('train').get('output_folder_name')
+if not os.path.exists(os.path.join(thisdir, OUTPUT_FOLDER)):
+        os.makedirs(os.path.join(thisdir, OUTPUT_FOLDER))
+LOGS = get_subconfig('train').get('logs')
+if LOGS:
+    wandb.login()
+    wandb.init(project="GMVAE", name="Train_GMVAE", reinit=True)
 
-
-
-# LOGS
-LOGS = True
-METRICS = True
-PROJECT_NAME = 'MD-VAE_TINYSOL'
-
-# Seed for reproducibility
 SEED = 1234
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-
-# Beta warm-up (epochs)
-WARMUP = 250
-
-# Pretraining withouth removers
-PRETRAIN = 250
-
-# Weight for the losses
-RECON_LAMBDA = 50 #1
-CLASS_LAMBDA = 2 #1
-REM_LAMBDA = 0.1
-
-
-
       
-def train_multidescriptor(model, 
-                          dataloaders, 
-                          classifiers, 
-                          removers, 
-                          bs, 
-                          num_epochs, 
-                          lr, 
-                          scheduler_patience, 
-                          early_stopping_patience):
+def train(model, 
+        dataloaders, 
+        classifiers, 
+        removers, 
+        num_epochs, 
+        lr, 
+        recon_loss_fn,
+        kl_emb_loss_fn,
+        classifier_loss_fn,
+        remover_loss_fn,
+        remover_kl_loss_fn,
+        beta_warmup,
+        pretrain_no_removers,
+        scheduler_patience, 
+        early_stopping_patience
+        ):
     model.apply(xavier_init)
     model.to(device)
     
-    if removers is not None:
-        for name, remover in removers.items():
-            remover.apply(kaiming_init)
-            # Take parameters for optimization            
-        optimizer_removers = Adam([param for rem in removers.values() for param in rem.parameters()], lr=lr)
-        optimizer_removers = Adam(removers.parameters(), lr=lr)
+    for _, remover in removers.items():
+        remover.apply(kaiming_init)
+    optimizer_removers = Adam(
+        [param for remover in removers.values() for param in remover.parameters()], 
+        weight_decay=1e-5,
+        lr=lr)
         
-    optimizer_model = Adam(model.parameters(), lr=lr)
+    optimizer_model = Adam(
+        list(model.parameters()) + 
+        [p for clf in classifiers.values() for p in clf.parameters()],
+        weight_decay=1e-5,
+        lr=lr
+    )
     
-    # Learning rate scheduler
-    scheduler = ReduceLROnPlateau(optimizer_model, mode='min', factor=0.5, patience=50, min_lr=1e-6) #ReduceLROnPlateau(optimizer_model, mode='min', factor=0.1, patience=10, min_lr=1e-6)
-
+    scheduler = ReduceLROnPlateau(optimizer_model, mode='min', factor=0.5, patience=scheduler_patience, min_lr=1e-6) 
+    early_stopping = EarlyStopping(patience=early_stopping_patience, min_delta=0.00001)
     best_loss = float('inf')
-    best_classifier_loss = float('inf')
-    early_stopping = EarlyStopping(patience=1000, min_delta=0.01)
 
     for epoch in range(num_epochs):
         print('-' * 50)
-        print(f'[EPOCH] {epoch}/{num_epochs - 1}')
+        print(f'[EPOCH] {epoch+1}/{num_epochs}')
 
         for phase in ['train', 'val']:
             print(f'Phase: {phase}')
 
             total_loss = 0
             total_recon = 0
-            total_timbre_kld = 0
-            total_pitch_kld = 0
-            total_velocity_kld = 0
-            total_duration_kld = 0
-            total_timbre_loss = 0
-            total_pitch_loss = 0
-            total_velocity_loss = 0
-            total_duration_loss = 0
             total_removers_KL_loss = 0
             total_removers_loss = 0
-            total_classier_loss = 0
-
+    
             for S, T, P, V, D in tqdm(dataloaders[phase]):
                 spectrogram, timbre_label, pitch_label, velocity_label, duration_label = S.to(device), T.to(device), P.to(device), V.to(device), D.to(device)
-                    
-                target_classes = {'timbre': timbre_label,
-                                    'pitch': pitch_label,
-                                    'velocity': velocity_label,
-                                    'duration': duration_label
-                                    }
+                
+                descriptors = ['timbre', 'pitch', 'velocity', 'duration']
+                target_classes = {
+                    'timbre': timbre_label,
+                    'pitch': pitch_label,
+                    'velocity': velocity_label,
+                    'duration': duration_label
+                }
 
                 if phase == 'train':
                     model.train()
@@ -139,85 +109,60 @@ def train_multidescriptor(model,
 
                 x_predict, latents = model(spectrogram)
                 
-                mse = weighted_mse_loss(x_predict, spectrogram)
-                huber_loss = F.huber_loss(x_predict, spectrogram)
-                recon_loss = torch.mean(mse + huber_loss, dim=0)
-                class_logits = {}
-                class_probs = {}
-                neg_kld_z = {}
-                for descriptor in target_classes.keys():
-                    class_logits[descriptor], class_probs[descriptor], _ = model._infer_descriptor_class(
-                        latents[descriptor]['z'], descriptor=descriptor
-                    )
-                    neg_kld_z[descriptor] = -1 * kl_latent(
-                        latents[descriptor]['mu'], 
-                        latents[descriptor]['logvar'], 
-                        class_probs[descriptor], 
-                        model.mu_lookup[descriptor], 
-                        model.logvar_lookup[descriptor]
-                    ) * 0.00025
+                recon_loss = recon_loss_fn(x_predict, spectrogram)
 
-                timbre_kld = torch.mean(neg_kld_z['timbre'], dim=0)
-                pitch_kld = torch.mean(neg_kld_z['pitch'], dim=0)
-                velocity_kld = torch.mean(neg_kld_z['velocity'], dim=0)
-                duration_kld = torch.mean(neg_kld_z['duration'], dim=0)
-
-                class_tot_loss, class_losses = classifier_loss(
-                    target_classes, 
-                    class_logits, 
-                    weights={'timbre': 4, 'pitch': 2, 'velocity': 2, 'duration': 2}
-                )
+                kl_losses = {}
+                class_losses = {}
+                loss_totals = {f'total_{desc}_kld': 0 for desc in descriptors}
+                loss_totals.update({f'total_{desc}_loss': 0 for desc in descriptors})
                 
-                class_tot_loss = torch.mean(class_tot_loss, dim=0) 
-                for name, loss in class_losses.items():
-                    class_losses[name] = torch.mean(loss, dim=0)  
-                 
-                beta = epoch/WARMUP
-                lower_bound = -1 * ((recon_loss) + (timbre_kld + pitch_kld + velocity_kld + duration_kld) * min(beta, 1.0)) # 
-                print(f'[LOWER_BOUND] {lower_bound.item()}')
-                print(f'[RECON_LOSS] {recon_loss.item()}')
-                print(f'[pitch_KLD] {pitch_kld.item()}')
-                overall_loss = lower_bound  + class_tot_loss 
+                for desc in descriptors:
+                    kl_losses[desc] = kl_emb_loss_fn(
+                        model.mu_lookup[desc], model.logvar_lookup[desc], 
+                        latents[desc]['mu'], latents[desc]['logvar'], 
+                        target_classes[desc]
+                    )
+                    
+                    class_pred = classifiers[desc](latents[desc]['z'])
+                    class_losses[desc] = classifier_loss_fn(class_pred, target_classes[desc])
 
-                t_remover_input = torch.cat((latents['pitch']['z'], latents['velocity']['z'], latents['duration']['z']), dim=1)
-                p_remover_input = torch.cat((latents['timbre']['z'], latents['velocity']['z'], latents['duration']['z']), dim=1)
-                v_remover_input = torch.cat((latents['timbre']['z'], latents['pitch']['z'], latents['duration']['z']), dim=1)
-                l_remover_input = torch.cat((latents['timbre']['z'], latents['pitch']['z'], latents['velocity']['z']), dim=1)                        
+                beta = epoch/beta_warmup if epoch < beta_warmup else 1
+                total_loss = (recon_loss + 
+                            beta * sum(kl_losses[desc].mean() for desc in descriptors) +
+                            sum(class_losses[desc] for desc in descriptors))
 
-        # FIRST STAGE
-                if removers is not None and epoch >= PRETRAIN:
-                    beta_rem = REM_LAMBDA*(epoch-PRETRAIN)/WARMUP
+                remover_inputs = {
+                    'timbre': torch.cat([latents[d]['z'] for d in ['pitch', 'velocity', 'duration']], dim=1),
+                    'pitch': torch.cat([latents[d]['z'] for d in ['timbre', 'velocity', 'duration']], dim=1),
+                    'velocity': torch.cat([latents[d]['z'] for d in ['timbre', 'pitch', 'duration']], dim=1),
+                    'duration': torch.cat([latents[d]['z'] for d in ['timbre', 'pitch', 'velocity']], dim=1)
+                }
+
+                # FIRST STAGE
+                if epoch >= pretrain_no_removers:
+                    beta_rem = (epoch-pretrain_no_removers)/(beta_warmup if epoch < beta_warmup else 1)
                     for _, remover in removers.items():
                         remover.eval()
 
-                    t_remover_KL_loss = remover_kl_uniform_loss(removers['timbre'], t_remover_input, model.latent_classes['timbre'])
-                    p_remover_KL_loss = remover_kl_uniform_loss(removers['pitch'], p_remover_input, model.latent_classes['pitch'])
-                    v_remover_KL_loss = remover_kl_uniform_loss(removers['velocity'], v_remover_input, model.latent_classes['velocity'])
-                    l_remover_KL_loss = remover_kl_uniform_loss(removers['duration'], l_remover_input, model.latent_classes['duration'])
-                    total_removers_KL_loss += t_remover_KL_loss.item() + p_remover_KL_loss.item() + v_remover_KL_loss.item() + l_remover_KL_loss.item()
-                
+                    remover_kl_losses = {}
+                    for desc in descriptors:
+                        rem_logits = removers[desc](remover_inputs[desc])
+                        num_classes = model.num_classes[desc]
+                        remover_kl_losses[desc] = remover_kl_loss_fn(rem_logits, num_classes)
                 else:
                     beta_rem = 0
-                    t_remover_KL_loss = torch.zeros(1).to(device)
-                    p_remover_KL_loss = torch.zeros(1).to(device)
-                    v_remover_KL_loss = torch.zeros(1).to(device)
-                    l_remover_KL_loss = torch.zeros(1).to(device)
+                    remover_kl_losses = {desc: torch.zeros(1).to(device) for desc in descriptors}
 
-                    total_removers_kl_loss = torch.zeros(1).to(device)
-
-                first_loss = -1 * overall_loss + (t_remover_KL_loss + p_remover_KL_loss + v_remover_KL_loss + l_remover_KL_loss) * min(beta_rem, REM_LAMBDA)
+                first_loss = total_loss + sum(remover_kl_losses.values()) * beta_rem
 
                 total_loss += first_loss.item()
                 total_recon += recon_loss.item()
-                total_timbre_kld += timbre_kld.item()
-                total_pitch_kld += pitch_kld.item()
-                total_velocity_kld += velocity_kld.item()
-                total_duration_kld += duration_kld.item()
-                total_timbre_loss += class_losses['timbre'].item()
-                total_pitch_loss += class_losses['pitch'].item()
-                total_velocity_loss += class_losses['velocity'].item()
-                total_duration_loss += class_losses['duration'].item()
-                total_classier_loss += class_tot_loss.item()
+                
+                for desc in descriptors:
+                    loss_totals[f'total_{desc}_kld'] += kl_losses[desc].sum().item()
+                    loss_totals[f'total_{desc}_loss'] += class_losses[desc].item()
+                
+                total_removers_KL_loss += sum(loss.item() for loss in remover_kl_losses.values())
 
                 if phase == 'train':
                     optimizer_model.zero_grad()
@@ -225,294 +170,201 @@ def train_multidescriptor(model,
                     clip_grad_norm_(model.parameters(), 1.0)
                     optimizer_model.step()
 
-        # SECOND STAGE
-                if removers is not None:
-                    model.eval()
-                    for _, remover in removers.items():
-                        remover.train()
+                # SECOND STAGE
+                model.eval()
+                for _, remover in removers.items():
+                    remover.train()
 
-                    t_remover_input = torch.cat((latents['pitch']['z'], latents['velocity']['z'], latents['duration']['z']), dim=1).detach()
-                    p_remover_input = torch.cat((latents['timbre']['z'], latents['velocity']['z'], latents['duration']['z']), dim=1).detach()
-                    v_remover_input = torch.cat((latents['timbre']['z'], latents['pitch']['z'], latents['duration']['z']), dim=1).detach()
-                    l_remover_input = torch.cat((latents['timbre']['z'], latents['pitch']['z'], latents['velocity']['z']), dim=1).detach()
+                detached_inputs = {desc: inp.detach() for desc, inp in remover_inputs.items()}
+                remover_losses = {}
+                for desc in descriptors:
+                    rem_logits = removers[desc](detached_inputs[desc])
+                    remover_losses[desc] = remover_loss_fn(rem_logits, target_classes[desc])
+                
+                second_loss = sum(remover_losses.values()) 
+                total_removers_loss += sum(loss.item() for loss in remover_losses.values())
 
-                    t_remover_loss = remover_loss(removers['timbre'], t_remover_input, target_classes['timbre'])
-                    p_remover_loss = remover_loss(removers['pitch'], p_remover_input, target_classes['pitch'])
-                    v_remover_loss = remover_loss(removers['velocity'], v_remover_input, target_classes['velocity'])
-                    l_remover_loss = remover_loss(removers['duration'], l_remover_input, target_classes['duration'])
-                    second_loss = (t_remover_loss + p_remover_loss + v_remover_loss + l_remover_loss) * REM_LAMBDA
-
-                    total_removers_loss += t_remover_loss.item() + p_remover_loss.item() + v_remover_loss.item() + l_remover_loss.item()
-
-                    if phase == 'train':
-                        optimizer_removers.zero_grad()
-                        second_loss.backward()
-                        optimizer_removers.step()
-                    model.train()
+                if phase == 'train':
+                    optimizer_removers.zero_grad()
+                    second_loss.backward()
+                    optimizer_removers.step()
+                model.train()
                         
             if phase == 'train':
                 scheduler.step(total_loss)
-                print("[LR] Last Learning Rate",scheduler.get_last_lr())
-            
+
             if phase == 'val':
+                print(f'[LOSS RECON]: {total_recon / len(dataloaders[phase])}')
+                print(f'[LOSS]: {total_loss / len(dataloaders[phase])}')
+                print("[LR]", scheduler.get_last_lr())
                 if total_loss < best_loss:
-                    print('[LOSS] PREVIOUS best loss:', best_loss)
                     best_loss = total_loss
-                    print("[MODEL] Saving model...")
-                    torch.save(model.state_dict(), MODELPATH)
-                    print('[MODEL] Model saved!!')
-                    print(f'[LOSS] ACTUAL best loss: {best_loss}')
+                    print("[MODEL] Saving...")
+                    torch.save(model.state_dict(), os.path.join(thisdir, OUTPUT_FOLDER, 'MD_GMVAE_.pth'))
                 early_stopping(total_loss / len(dataloaders[phase]))
 
             if early_stopping.early_stop:
-                print(f"[EARLY_STOPPING] Training stopped on epoch: {epoch}")
+                print(f"[EARLY_STOPPING]: {epoch}")
                 return
 
             if LOGS:
-                wandb.log({f"{phase}/global_loss": total_loss / len(dataloaders[phase]),
-                            f"{phase}/reconstruction_loss": recon_loss / len(dataloaders[phase]),
-                            f"{phase}/timbre_kld": -1 * total_timbre_kld / len(dataloaders[phase]),
-                            f"{phase}/pitch_kld": -1 * total_pitch_kld / len(dataloaders[phase]),
-                            f"{phase}/velocity_kld": -1 * total_velocity_kld / len(dataloaders[phase]),
-                            f"{phase}/duration_kld": -1 * total_duration_kld / len(dataloaders[phase]),
-                            f"{phase}/timbre_loss": total_timbre_loss / len(dataloaders[phase]),
-                            f"{phase}/pitch_loss": total_pitch_loss / len(dataloaders[phase]),
-                            f"{phase}/velocity_loss": total_velocity_loss / len(dataloaders[phase]),
-                            f"{phase}/duration_loss": total_duration_loss / len(dataloaders[phase]),
-                            f"{phase}/remover_KL": total_removers_kl_loss / len(dataloaders[phase]),
-                            f"{phase}/remover_loss": total_removers_loss / len(dataloaders[phase])
-                            })
+                log_dict = {
+                    f"{phase}/global_loss": total_loss / len(dataloaders[phase]),
+                    f"{phase}/reconstruction_loss": total_recon / len(dataloaders[phase]),
+                    f"{phase}/remover_KL_loss": total_removers_KL_loss / len(dataloaders[phase]),
+                    f"{phase}/remover_loss": total_removers_loss / len(dataloaders[phase]),
+                }
+                for desc in descriptors:
+                    log_dict.update({
+                        f"{phase}/{desc}_kl_loss": loss_totals[f'total_{desc}_kld'] / len(dataloaders[phase]),
+                        f"{phase}/{desc}_loss": loss_totals[f'total_{desc}_loss'] / len(dataloaders[phase]),
+                    })
+                
+                wandb.log(log_dict)
+                wandb.log({"learning_rate": scheduler.get_last_lr()[0]})
 
-                if phase == 'val':
-                    fig, axs = plt.subplots(1, 2, figsize=(10, 4))
-                    axs[0].imshow(spectrogram[0].squeeze(0).cpu().detach().numpy(), cmap='inferno', origin='lower')
-                    axs[0].set_title("Original Spectrogram")
-                    axs[1].imshow(x_predict[0].squeeze(0).cpu().detach().numpy(), cmap='inferno', origin='lower')
-                    axs[1].set_title("Reconstructed Spectrogram")
-                    wandb.log({"MDVAE_spectrograms": wandb.Image(plt)})
-                    plt.close(fig)
-                else:
-                    wandb.log({"learning_rate": scheduler.get_last_lr()[0]})
+                if phase == 'val' and epoch % 5 == 0:
+                    log_spectrograms(spectrogram, x_predict)
 
-    
-    
-def test_multidescriptor(model, dataloaders, removers=None):
+
+def test(model, 
+         dataloaders, 
+         classifiers, 
+         recon_loss_fn, 
+         kl_emb_loss_fn, 
+         classifier_loss_fn):
     model.to(device)
-    model.load_state_dict(torch.load(MODELPATH))
+    model.load_state_dict(torch.load(os.path.join(thisdir, OUTPUT_FOLDER, 'MD_GMVAE_.pth')))
     model.eval()
     phase = 'test'
     
     print(f'Phase: {phase}')
     
-    total_loss = 0
-    total_lowerbound = 0
-    total_logpx_z = 0
-    total_timbre_kld_y = 0
-    total_timbre_kld_z = 0
-    total_pitch_kld_y = 0
-    total_pitch_kld_z = 0
-    total_velocity_kld_y = 0
-    total_velocity_kld_z = 0
-    total_duration_kld_y = 0
-    total_duration_kld_z = 0
-    total_timbre_h_y = 0
-    total_pitch_h_y = 0
-    total_velocity_h_y = 0
-    total_duration_h_y = 0
-    total_label_loss = 0
-    total_pitch_classify_loss = 0
-    total_velocity_classify_loss = 0
-    total_duration_classify_loss = 0
-    total_simple_mse_loss = 0
-
-    all_timbre_true = []
-    all_timbre_pred = []
-    all_pitch_true = []
-    all_pitch_pred = []
-    all_velocity_true = []
-    all_velocity_pred = []
-    all_duration_true = []
-    all_duration_pred = []
+    descriptors = ['timbre', 'pitch', 'velocity', 'duration']
     
-    for S, _, T, P, D, L in tqdm(dataloaders[phase]):
+    total_loss = 0
+    total_recon = 0
+    total_samples = 0
+    
+    total_kl = {desc: 0 for desc in descriptors}
+    total_classifier_loss = {desc: 0 for desc in descriptors}
+    
+    all_true = {desc: [] for desc in descriptors}
+    all_pred = {desc: [] for desc in descriptors}
+    all_latents = {desc: [] for desc in descriptors}
+
+    for S, T, P, V, D in tqdm(dataloaders[phase]):
         spectrogram = S.to(device)
+        timbre_label = T.to(device)
+        pitch_label = P.to(device)
+        velocity_label = V.to(device)
+        duration_label = D.to(device)
 
-        target_classes = {'timbre': T.to(device),
-                          'pitch': P.to(device),
-                          'velocity': D.to(device),
-                          'duration': L.to(device)
-                          }
+        target_classes = {
+            'timbre': timbre_label,
+            'pitch': pitch_label,
+            'velocity': velocity_label,
+            'duration': duration_label
+        }
 
-        # Forward pass
-        x_predict, latents = model(spectrogram)
+        with torch.no_grad():
+            x_predict, latents = model(spectrogram)
+            recon_loss = recon_loss_fn(x_predict, spectrogram)
 
-        # Reconstruction loss (Weighted MSE + Huber loss)
-        loss1 = F.mse_loss(x_predict, spectrogram)
-        loss2 = F.huber_loss(x_predict, spectrogram)
-        logpx_z = -1 * (loss1 + loss2)
+            kl_losses = {}
+            class_losses = {}
+            class_preds = {}
 
-        # Compute the kl_latent for each descriptor
-        log_q_y_logit = {}
-        q_y = {}
-        neg_kld_z = {}
-        for name in target_classes.keys():
-            log_q_y_logit[name], q_y[name], _ = model.infer_descriptor_class(latents[name][-1], descriptor=name)
-            neg_kld_z[name] = -1 * kl_latent(latents[name][0], latents[name][1], q_y[name], model.mu_lookup[name], model.logvar_lookup[name])
+            for desc in descriptors:
+                kl_losses[desc] = kl_emb_loss_fn(
+                    model.mu_lookup[desc], model.logvar_lookup[desc], 
+                    latents[desc]['mu'], latents[desc]['logvar'], 
+                    target_classes[desc]
+                )
+                class_pred = classifiers[desc](latents[desc]['z'])  # logits for desc
+                class_preds[desc] = class_pred
+                class_losses[desc] = classifier_loss_fn(class_pred, target_classes[desc])
             
-        # Compute the kl_class for each descriptor
-        kld_y = {}
-        h_y = {}
-        neg_kld_y = {}
-        for name in target_classes.keys():
-            kld_y[name], h_y[name] = kl_class(log_q_y_logit[name], q_y[name], model.latent_classes[name])
-            neg_kld_y[name] = -1 * kld_y[name]
-            
-        logpx_z = torch.mean(logpx_z, dim=0)
-        
-        timbre_kld_z = torch.mean(neg_kld_z['timbre'], dim=0)
-        pitch_kld_z = torch.mean(neg_kld_z['pitch'], dim=0)
-        velocity_kld_z = torch.mean(neg_kld_z['velocity'], dim=0)
-        duration_kld_z = torch.mean(neg_kld_z['duration'], dim=0)
-        
-        timbre_kld_y = torch.mean(neg_kld_y['timbre'], dim=0)
-        pitch_kld_y = torch.mean(neg_kld_y['pitch'], dim=0)
-        velocity_kld_y = torch.mean(neg_kld_y['velocity'], dim=0)
-        duration_kld_y = torch.mean(neg_kld_y['duration'], dim=0)
-        
-        # Compute the lower bound
-        lower_bound = (logpx_z + timbre_kld_y + pitch_kld_y + velocity_kld_y + duration_kld_y + timbre_kld_z + pitch_kld_z + velocity_kld_z + duration_kld_z)
-        
-        # Classification loss forward pass
-        class_tot_loss, class_losses = classifier_loss(target_classes, log_q_y_logit, weights={'timbre': 4, 'pitch': 2, 'velocity': 2, 'duration': 2})
-        class_tot_loss = torch.mean(class_tot_loss, dim=0)
-        for name in class_losses.keys():
-            class_losses[name] = torch.mean(class_losses[name], dim=0)
-            
-        for name in h_y.keys():
-            h_y[name] = torch.mean(h_y[name], dim=0)
-            
-        # Compute the overall loss
-        overall_loss = -1*lower_bound + class_tot_loss
+            total_loss_batch = recon_loss + sum(kl_losses[desc].mean() for desc in kl_losses) + sum(class_losses[desc] for desc in class_losses)
 
-        simple_mse_loss = F.mse_loss(x_predict, spectrogram)
-        total_simple_mse_loss += simple_mse_loss.item()
-        
-        total_loss += overall_loss.item()
-        total_lowerbound += lower_bound.item()
-        total_logpx_z += logpx_z.item()
-        total_timbre_kld_y += timbre_kld_y.item()
-        total_timbre_kld_z += timbre_kld_z.item()
-        total_pitch_kld_y += pitch_kld_y.item()
-        total_pitch_kld_z += pitch_kld_z.item()
-        total_velocity_kld_y += velocity_kld_y.item()
-        total_velocity_kld_z += velocity_kld_z.item()
-        total_duration_kld_y += duration_kld_y.item()
-        total_duration_kld_z += duration_kld_z.item()
-        total_timbre_h_y += h_y['timbre'].item()
-        total_pitch_h_y += h_y['pitch'].item()
-        total_velocity_h_y += h_y['velocity'].item()
-        total_duration_h_y += h_y['duration'].item()
-        total_label_loss += class_losses['timbre'].item()
-        total_pitch_classify_loss += class_losses['pitch'].item()
-        total_velocity_classify_loss += class_losses['velocity'].item()
-        total_duration_classify_loss += class_losses['duration'].item()
+            total_loss += total_loss_batch.item()
+            total_recon += recon_loss.item()
+            total_samples += spectrogram.size(0)
 
-        all_timbre_true.extend(target_classes['timbre'].cpu().numpy())
-        all_timbre_pred.extend(log_q_y_logit['timbre'].argmax(dim=1).cpu().numpy())
-        all_pitch_true.extend(target_classes['pitch'].cpu().numpy())
-        all_pitch_pred.extend(log_q_y_logit['pitch'].argmax(dim=1).cpu().numpy())
-        all_velocity_true.extend(target_classes['velocity'].cpu().numpy())
-        all_velocity_pred.extend(log_q_y_logit['velocity'].argmax(dim=1).cpu().numpy())
-        all_duration_true.extend(target_classes['duration'].cpu().numpy())
-        all_duration_pred.extend(log_q_y_logit['duration'].argmax(dim=1).cpu().numpy())
+            for desc in descriptors:
+                total_kl[desc] += kl_losses[desc].sum().item()
+                total_classifier_loss[desc] += class_losses[desc].item()
+            for desc in descriptors:
+                preds_np = class_preds[desc].argmax(dim=1).cpu().numpy()
+                true_np = target_classes[desc].cpu().numpy()
+                all_pred[desc].extend(preds_np)
+                all_true[desc].extend(true_np)
+                all_latents[desc].append(latents[desc]['z'].cpu().numpy())
 
-        timbre_accuracy = accuracy_score(all_timbre_true, all_timbre_pred)
-        timbre_f1 = f1_score(all_timbre_true, all_timbre_pred, average='weighted')
-        timbre_confusion_matrix = confusion_matrix(all_timbre_true, all_timbre_pred)
-
-        pitch_accuracy = accuracy_score(all_pitch_true, all_pitch_pred)
-        pitch_f1 = f1_score(all_pitch_true, all_pitch_pred, average='weighted')
-        pitch_confusion_matrix = confusion_matrix(all_pitch_true, all_pitch_pred)
-
-        velocity_accuracy = accuracy_score(all_velocity_true, all_velocity_pred)
-        velocity_f1 = f1_score(all_velocity_true, all_velocity_pred, average='weighted')
-        velocity_confusion_matrix = confusion_matrix(all_velocity_true, all_velocity_pred)
-
-        duration_accuracy = accuracy_score(all_duration_true, all_duration_pred)
-        duration_f1 = f1_score(all_duration_true, all_duration_pred, average='weighted')
-        duration_confusion_matrix = confusion_matrix(all_duration_true, all_duration_pred)
-
+    print(f"Avg reconstruction loss: {total_recon / total_samples:.4f}")
+    print(f"Avg total loss: {total_loss / total_samples:.4f}")
 
     if LOGS:
-        wandb.log({"test/global_loss": total_loss / len(dataloaders[phase]),
-                    "test/lower_bound": total_lowerbound / len(dataloaders[phase]), 
-                    "test/reconstruction_loss": -1 * total_logpx_z / len(dataloaders[phase]),
-                    "test/timbre_kl_class_y": -1 * total_timbre_kld_y / len(dataloaders[phase]),
-                    "test/timbre_kl_latent_z": -1 * total_timbre_kld_z / len(dataloaders[phase]),
-                    "test/timbre_entropy": total_timbre_h_y / len(dataloaders[phase]),
-                    "test/pitch_kl_class_y": -1 * total_pitch_kld_y / len(dataloaders[phase]),
-                    "test/pitch_kl_latent_z": -1 * total_pitch_kld_z / len(dataloaders[phase]),
-                    "test/pitch_entropy": total_pitch_h_y / len(dataloaders[phase]),
-                    "test/velocity_kl_class_y": -1 * total_velocity_kld_y / len(dataloaders[phase]),
-                    "test/velocity_kl_latent_z": -1 * total_velocity_kld_z / len(dataloaders[phase]),
-                    "test/velocity_entropy": total_velocity_h_y / len(dataloaders[phase]),
-                    "test/duration_kl_class_y": -1 * total_duration_kld_y / len(dataloaders[phase]),
-                    "test/duration_kl_latent_z": -1 * total_duration_kld_z / len(dataloaders[phase]),
-                    "test/duration_entropy": total_duration_h_y / len(dataloaders[phase]),
-                    "test/classifier_loss": total_label_loss / len(dataloaders[phase]),
-                    "test/timbre_loss": total_label_loss / len(dataloaders[phase]), 
-                    "test/pitch_loss": total_pitch_classify_loss / len(dataloaders[phase]), 
-                    "test/velocity_loss": total_velocity_classify_loss / len(dataloaders[phase]),
-                    "test/duration_loss": total_duration_classify_loss / len(dataloaders[phase]),
-                    "test/simple_mse_loss": total_simple_mse_loss/ len(dataloaders[phase]),
-                    })
-            
+        log_dict = {
+            "test/global_loss": total_loss / total_samples,
+            "test/reconstruction_loss": total_recon / total_samples,
+        }
+        for desc in descriptors:
+            log_dict[f"test/{desc}_kl_loss"] = total_kl[desc] / total_samples
+            log_dict[f"test/{desc}_classifier_loss"] = total_classifier_loss[desc] / total_samples
+        wandb.log(log_dict)
 
-    if METRICS:
+        for desc in descriptors:
+            all_latents[desc] = np.concatenate(all_latents[desc], axis=0)
+            all_true[desc] = np.array(all_true[desc])
 
-        timbre_accuracy = accuracy_score(all_timbre_true, all_timbre_pred)
-        timbre_f1 = f1_score(all_timbre_true, all_timbre_pred, average='weighted')
-        timbre_confusion_matrix = confusion_matrix(all_timbre_true, all_timbre_pred)
+            accuracy = accuracy_score(all_true[desc], all_pred[desc])
+            f1 = f1_score(all_true[desc], all_pred[desc], average='weighted')
+            confusion = confusion_matrix(all_true[desc], all_pred[desc])
 
-        pitch_accuracy = accuracy_score(all_pitch_true, all_pitch_pred)
-        pitch_f1 = f1_score(all_pitch_true, all_pitch_pred, average='weighted')
-        pitch_confusion_matrix = confusion_matrix(all_pitch_true, all_pitch_pred)
+            plot_confusion_matrix(
+                confusion,
+                descriptor=desc,
+                true_labels=all_true[desc],
+                output_path=os.path.join(thisdir, OUTPUT_FOLDER)
+            )
 
-        velocity_accuracy = accuracy_score(all_velocity_true, all_velocity_pred)
-        velocity_f1 = f1_score(all_velocity_true, all_velocity_pred, average='weighted')
-        velocity_confusion_matrix = confusion_matrix(all_velocity_true, all_velocity_pred)
+            plot_latent_space(
+                all_latents[desc],
+                all_true[desc],
+                descriptor=desc,
+                output_path=os.path.join(thisdir, OUTPUT_FOLDER)
+            )
 
-        duration_accuracy = accuracy_score(all_duration_true, all_duration_pred)
-        duration_f1 = f1_score(all_duration_true, all_duration_pred, average='weighted')
-        duration_confusion_matrix = confusion_matrix(all_duration_true, all_duration_pred)
+            print(f"{desc} accuracy: {accuracy:.4f}, f1: {f1:.4f}")
+            wandb.log({
+                f"test/{desc}_accuracy": accuracy,
+                f"test/{desc}_f1": f1
+            })
 
-        # Save confusion matrices as .png files
-        '''plot_confusion_matrix(timbre_confusion_matrix, title='MULTIDESCRIPTOR_Timbre_Confusion_Matrix', class_labels=timbre_class_names, confusion_path=CONFUSION_PATH)
-        plot_confusion_matrix(pitch_confusion_matrix, title='MULTIDESCRIPTOR_Pitch_Confusion_Matrix', class_labels=pitch_class_names, confusion_path=CONFUSION_PATH)
-        plot_confusion_matrix(velocity_confusion_matrix, title='MULTIDESCRIPTOR_Velocity_Confusion_Matrix', class_labels=velocity_class_names, confusion_path=CONFUSION_PATH)
-        plot_confusion_matrix(duration_confusion_matrix, title='MULTIDESCRIPTOR_Duration_Confusion_Matrix', class_labels=duration_class_names, confusion_path=CONFUSION_PATH)'''
 
-        wandb.log({"test/timbre_accuracy": timbre_accuracy, "test/timbre_f1": timbre_f1, 
-                    "test/pitch_accuracy": pitch_accuracy, "test/pitch_f1": pitch_f1,
-                    "test/velocity_accuracy": velocity_accuracy, "test/velocity_f1": velocity_f1,
-                    "test/duration_accuracy": duration_accuracy, "test/duration_f1": duration_f1
-                    })
+
         
         
 def main():
     '''Main function to train and test the model'''
-    timbre_latent_dim = get_subconfig('latent_dims').get('timbre')
-    pitch_latent_dim = get_subconfig('latent_dims').get('pitch')
-    velocity_latent_dim = get_subconfig('latent_dims').get('velocity')
-    duration_latent_dim = get_subconfig('latent_dims').get('duration')
-    bs = get_subconfig('train').get('batch_size')
-    epochs = get_subconfig('train').get('num_epochs')
-    lr = float(get_subconfig('train').get('learning_rate'))
-    scheduler_patience = get_subconfig('train').get('scheduler_patience')
-    early_stopping_patience = get_subconfig('train').get('early_stopping_patience')
+    timbre_latent_dim =         get_subconfig('latent_dims').get('timbre')
+    pitch_latent_dim =          get_subconfig('latent_dims').get('pitch')
+    velocity_latent_dim =       get_subconfig('latent_dims').get('velocity')
+    duration_latent_dim =       get_subconfig('latent_dims').get('duration')
+    min_pitch, max_pitch =      get_subconfig('train').get('pitch_range')
+    bs =                        get_subconfig('train').get('batch_size')
+    epochs =                    get_subconfig('train').get('num_epochs')
+    lr =                        float(get_subconfig('train').get('learning_rate'))
+    beta_warmup =               get_subconfig('train').get('beta_warmup')
+    pretrain_no_removers =      get_subconfig('train').get('pretrain_no_removers')
+    scheduler_patience =        get_subconfig('train').get('scheduler_patience')
+    early_stopping_patience =   get_subconfig('train').get('early_stopping_patience')
+
 
     dataframe = pd.read_csv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset/metadata.csv"))
-    tinysol_dataset = TinySol_Dataset(dataframe)
+    filtered_df = dataframe[(dataframe['Pitch'] >= min_pitch) & (dataframe['Pitch'] <= max_pitch)]
+    tinysol_dataset = TinySol_Dataset(filtered_df)
     train_dataset, val_dataset, test_dataset = random_split(tinysol_dataset, [0.8, 0.1, 0.1])
  
     num_classes = {
@@ -544,30 +396,35 @@ def main():
         'test': DataLoader(test_dataset, batch_size=bs, drop_last=False, shuffle=False, num_workers=8)
     }
 
-    
-    if not os.path.exists(CHECKPOINT_PATH):
-        os.makedirs(CHECKPOINT_PATH)
-    if not os.path.exists(CONFUSION_PATH):
-        os.makedirs(CONFUSION_PATH)
-    
-    if LOGS:
-        wandb.login()
-        wandb.init(project="GMVAE", name="Train_GMVAE", reinit=True)
+    recon_loss_fn = Reconstruction_Loss()
+    kl_emb_loss_fn = KL_Emb_Loss()
+    classifier_loss_fn = Classifier_Loss()
+    remover_loss_fn = Remover_Loss()
+    remover_kl_loss_fn = Remover_KL_Uniform_Loss()
   
-  
-    # Train the model
-    train_multidescriptor(model, 
-                          dataloaders, 
-                          classifiers=classifiers, 
-                          removers=removers, 
-                          bs=bs, 
-                          num_epochs=epochs, 
-                          lr=lr, 
-                          scheduler_patience=scheduler_patience, 
-                          early_stopping_patience=early_stopping_patience)
+    train(model=model, 
+            dataloaders=dataloaders, 
+            classifiers=classifiers, 
+            removers=removers, 
+            num_epochs=epochs, 
+            lr=lr, 
+            recon_loss_fn=recon_loss_fn,
+            kl_emb_loss_fn=kl_emb_loss_fn,
+            classifier_loss_fn=classifier_loss_fn,
+            remover_loss_fn=remover_loss_fn,
+            remover_kl_loss_fn=remover_kl_loss_fn,
+            beta_warmup=beta_warmup,
+            pretrain_no_removers=pretrain_no_removers,
+            scheduler_patience=scheduler_patience, 
+            early_stopping_patience=early_stopping_patience
+            )
     
-    # Test the model
-    #test_multidescriptor(model, dataloaders, removers=removers)
+    test(model=model, 
+         dataloaders=dataloaders, 
+         classifiers=classifiers,
+         recon_loss_fn=recon_loss_fn, 
+         kl_emb_loss_fn=kl_emb_loss_fn, 
+         classifier_loss_fn=classifier_loss_fn)
 
 
     if LOGS:

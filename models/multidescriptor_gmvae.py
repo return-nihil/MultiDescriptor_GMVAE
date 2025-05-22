@@ -147,8 +147,8 @@ class MultiDescriptorGMVAE(nn.Module):
                                       ) for descriptor in latents_dim_config
                                     })
         
-        self.n_classes = num_classes
-     
+        self.num_classes = num_classes
+
      
     def _build_lookup(self, num_embeddings, embedding_dim, trainable=False, pow_exp=None):
         '''Build a lookup table for the Gaussian Mixture'''
@@ -162,56 +162,8 @@ class MultiDescriptorGMVAE(nn.Module):
         lookup.weight.requires_grad = trainable
 
         return lookup
-      
-
-    def _log_gauss(self, z, mu, logvar):
-        squared_diff = torch.pow(z - mu, 2)
-        normalized_squared_diff = squared_diff / torch.exp(logvar)
-
-        log_prob = -0.5 * (
-            torch.sum(normalized_squared_diff + logvar, dim=1) + 
-            z.size(1) * np.log(2 * np.pi)
-        )
-        return log_prob
-    
-
-    def _approx_class_probabilities(self, z, mu_lookup, logvar_lookup, num_classes):
-        '''Estimate class probabilities for a latent vector using a mixture of gaussians'''
-        
-        class_logits = torch.zeros(z.size(0), num_classes, device=z.device)
-        log_prior = np.log(1 / num_classes)
-        
-        for class_idx in range(num_classes):
-            class_idx_tensor = torch.tensor(class_idx, device=z.device)
-            class_mean = mu_lookup(class_idx_tensor)
-            class_logvar = logvar_lookup(class_idx_tensor)
-            class_logits[:, class_idx] = self._log_gauss(z, class_mean, class_logvar) + log_prior
-        
-        class_prob = torch.nn.functional.softmax(class_logits, dim=1)
-        
-        return class_logits, class_prob
-
-
-    def _infer_class(self, z, mu_lookup, logvar_lookup, num_classes):
-        '''Predict the most likely class for a given latent vector using the GMM'''
-
-        class_logits, class_prob = self._approx_class_probabilities(
-            z, mu_lookup, logvar_lookup, num_classes
-        )
-        _, predicted_classes = torch.max(class_prob, dim=1)
-        
-        return class_logits, class_prob, predicted_classes
-
-
-    def _infer_descriptor_class(self, z, descriptor):
-        '''Predict the most likely class for a specific descriptor'''
-        mu_lookup = self.mu_lookup[descriptor]
-        logvar_lookup = self.logvar_lookup[descriptor]
-        num_classes = self.n_classes[descriptor]
-        
-        return self._infer_class(z, mu_lookup, logvar_lookup, num_classes)
  
-
+ 
     def forward(self, x):
         latents = self.encoder(x)
         z_tot = torch.cat([latents[name]['z'] for name in latents], dim=1)
