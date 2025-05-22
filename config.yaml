@@ -77,8 +77,8 @@ losses:
   kl_lambda: 0.0025
   class_lambda: 0.25
   class_weigths: {timbre: 2, pitch: 1, velocity: 1, duration: 1}
-  rem_lambda: 0.25
-  rem_kl_lambda: 0.0025
+  rem_lambda: 0.025
+  rem_kl_lambda: 0.00001
 
 train:
   batch_size: 32
@@ -86,9 +86,9 @@ train:
   learning_rate: 1e-3
   pitch_range: [48,71]
   beta_warmup: 100
-  pretrain_no_removers: 150
-  scheduler_patience: 50
-  early_stopping_patience: 300
+  pretrain_no_removers: 200
+  scheduler_patience: 30
+  early_stopping_patience: 100
   output_folder_name: 'outputs'
   logs: True
 

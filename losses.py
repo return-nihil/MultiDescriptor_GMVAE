@@ -85,4 +85,4 @@ class Remover_KL_Uniform_Loss(nn.Module):
         uniform = torch.full_like(probs, 1.0 / number_of_targets)
         kl_div = F.kl_div(probs.log(), uniform, reduction='batchmean')
 
-        return self.lambda_adv * kl_div
+        return kl_div * self.lambda_adv
