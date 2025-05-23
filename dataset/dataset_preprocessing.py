@@ -83,7 +83,8 @@ def process():
 
     duration_dict = build_duration_dict(max_dur_ms, dur_quant)
     metadata = []
-    instrument_set = set()
+    timbre_set = set()
+    pitch_set = set()
     velocity_set = set()
 
     for folder, _, files in os.walk(orig_folder):
@@ -92,12 +93,12 @@ def process():
                 continue
 
             file_path = os.path.join(folder, file)
-            instrument, pitch_str, velocity = parse_filename(file)
+            timbre, pitch_str, velocity = parse_filename(file)
 
             if velocity == 'p':  # fix bad label
                 velocity = 'pp'
 
-            instrument_set.add(instrument)
+            timbre_set.add(timbre)
             velocity_set.add(velocity)
 
             y, _ = librosa.load(file_path, sr=sr)
@@ -112,25 +113,27 @@ def process():
             np.save(output_path, spec)
 
             pitch = librosa.note_to_midi(pitch_str)
+            pitch_set.add(pitch_str)
             duration_ms = int(dur_sec * 1000)
             duration_class = quantize_duration(duration_ms, dur_quant, max_dur_ms)
 
             metadata.append({
                 'Path': os.path.abspath(output_path),
-                'Instrument': instrument,
+                'Instrument': timbre,
                 'Pitch': pitch,
                 'Velocity': velocity,
                 'Duration': duration_class
             })
 
-    instrument_dict = {k: i for i, k in enumerate(sorted(instrument_set))}
+    timbre_dict = {k: i for i, k in enumerate(sorted(timbre_set))}
+    pitch_dict = {note: librosa.note_to_midi(note) for note in sorted(pitch_set)}
     velocity_dict = {k: i for i, k in enumerate(sorted(velocity_set))}
 
     df_rows = []
     for entry in metadata:
         df_rows.append({
             'Path': entry['Path'],
-            'Timbre': instrument_dict[entry['Instrument']],
+            'Timbre': timbre_dict[entry['Instrument']],
             'Pitch': entry['Pitch'],
             'Velocity': velocity_dict[entry['Velocity']],
             'Duration': entry['Duration']
@@ -143,7 +146,8 @@ def process():
 
     with open(os.path.join(script_dir, 'class_mappings.json'), 'w') as f:
         json.dump({
-            'timbre_dict': instrument_dict,
+            'timbre_dict': timbre_dict,
+            'pitch_dict': pitch_dict,
             'velocity_dict': velocity_dict,
             'duration_dict': duration_dict
         }, f, indent=2)
