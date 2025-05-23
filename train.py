@@ -109,7 +109,8 @@ def train(model,
                 else:
                     model.eval()
 
-                x_predict, latents = model(spectrogram)
+                noisy_spectrogram = spectrogram + torch.randn_like(spectrogram) * 1e-4
+                x_predict, latents = model(noisy_spectrogram)
                 
                 recon_loss = recon_loss_fn(x_predict, spectrogram)
 
