@@ -51,13 +51,14 @@ class KL_Emb_Loss(nn.Module):
 
 class Latent_Spread_Loss(nn.Module):
     '''Enforce latent spread by minimizing variance'''
-    def __init__(self, lambda_spread=1e-3):
+    def __init__(self, 
+                 spread_lambda=get_subconfig('losses').get('spread_lambda')):
         super().__init__()
-        self.lambda_spread = lambda_spread
+        self.spread_lambda = spread_lambda
 
     def forward(self, z):
         var = torch.var(z, dim=0).mean()
-        return -var * self.lambda_spread
+        return self.spread_lambda / (var + 1e-8)
 
 
 class Classifier_Loss(nn.Module):
