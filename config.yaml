@@ -3,8 +3,8 @@
 device: "cuda:0"
 
 dataset_preprocessing:
-  orig_dataset_folder: "/mnt/volDISI_conci_Datasets/audio/TinySOL2020"
-  target_dataset_folder: "/mnt/volDISI_conci_Datasets/audio/TinySOL2020_GMVAE"
+  orig_dataset_folder: ""
+  target_dataset_folder: "" 
   max_dur: 5.94 # this for 256x256 mel spectrograms
   dur_quant: 250
   sr: 22050
