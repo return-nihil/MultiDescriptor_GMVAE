@@ -49,7 +49,7 @@ class KL_Emb_Loss(nn.Module):
         return torch.sum(kl, dim=1) * self.kl_lambda
     
 
-class LatentSpreadLoss(nn.Module):
+class Latent_Spread_Loss(nn.Module):
     '''Enforce latent spread by minimizing variance'''
     def __init__(self, lambda_spread=1e-3):
         super().__init__()

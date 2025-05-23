@@ -405,7 +405,7 @@ def main():
 
     recon_loss_fn = Reconstruction_Loss()
     kl_emb_loss_fn = KL_Emb_Loss()
-    spread_loss_fn = LatentSpreadLoss()
+    spread_loss_fn = Latent_Spread_Loss()
     classifier_loss_fn = Classifier_Loss()
     remover_loss_fn = Remover_Loss()
     remover_kl_loss_fn = Remover_KL_Uniform_Loss()
