@@ -9,6 +9,7 @@ import seaborn as sns
 import json
 import wandb
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
 from matplotlib.colors import hsv_to_rgb
 import random
 
@@ -70,61 +71,82 @@ def plot_confusion_matrix(cm, descriptor='', output_path='./confusion_matrix'):
 
 
 def generate_colors(n):
-    '''Generate n distinct colors avoiding green'''
-    colors = []
+    '''Generate n distinct colors avoiding green hues'''
     exclude_hue_min, exclude_hue_max = 0.22, 0.44  
-    for _ in range(n):
-        while True:
-            h = random.random()
-            if not (exclude_hue_min <= h <= exclude_hue_max):
-                break
-        s = 0.9 + 0.1 * random.random()
-        v = 0.9 + 0.1 * random.random()
+
+    allowed_hues = []
+    total_range = (exclude_hue_min) + (1 - exclude_hue_max)
+    for i in range(n):
+        hue_fraction = i / n
+        if hue_fraction < exclude_hue_min / total_range:
+            h = hue_fraction * total_range
+        else:
+            h = hue_fraction * total_range + (exclude_hue_max - exclude_hue_min)
+        allowed_hues.append(h % 1.0)
+
+    colors = []
+    for h in allowed_hues:
+        s = 0.95
+        v = 0.95
         rgb = hsv_to_rgb([h, s, v])
         colors.append(rgb)
+
     return colors
 
 
+
 def plot_latent_space(latents, true_labels, descriptor, output_path, filename_prefix):
-    '''t-SNE plot with square axes, legend outside, light blue background'''
+    '''t-SNE and PCA visualizations of the latent space'''
+
+    def plot(latents_2d, method_name):
+        full_class_labels = get_class_labels(descriptor)
+        unique_labels = np.unique(true_labels)
+        filtered_labels = [full_class_labels[i] for i in unique_labels]
+        n_classes = len(filtered_labels)
+        colors = generate_colors(n_classes)
+
+        fig_width = 8
+        legend_width = 3
+        fig_height = 8
+        sns.set_style("whitegrid")
+        plt.rcParams['axes.facecolor'] = (0.85, 0.9, 1, 0.25)
+        fig = plt.figure(figsize=(fig_width + legend_width, fig_height))
+        ax = fig.add_axes([0, 0, fig_width / (fig_width + legend_width), 1])
+
+        for idx, label in enumerate(filtered_labels):
+            class_idx = unique_labels[idx]
+            indices = np.where(true_labels == class_idx)[0]
+            ax.scatter(latents_2d[indices, 0], latents_2d[indices, 1], label=label,
+                       alpha=0.9, s=70, edgecolors='white', color=colors[idx])
+
+        ax.set_title(f"Latent Space - {method_name} - {descriptor}")
+        ax.set_xlabel(f'{method_name} dim 1')
+        ax.set_ylabel(f'{method_name} dim 2')
+
+        x_min, x_max = latents_2d[:, 0].min(), latents_2d[:, 0].max()
+        y_min, y_max = latents_2d[:, 1].min(), latents_2d[:, 1].max()
+        max_range = max(x_max - x_min, y_max - y_min)
+        x_mid = (x_max + x_min) / 2
+        y_mid = (y_max + y_min) / 2
+
+        ax.set_xlim(x_mid - max_range / 2, x_mid + max_range / 2)
+        ax.set_ylim(y_mid - max_range / 2, y_mid + max_range / 2)
+        ax.set_aspect('equal', adjustable='box')
+        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize='small', frameon=False)
+
+        os.makedirs(output_path, exist_ok=True)
+        file_name = f"{filename_prefix}_{method_name.lower()}_{descriptor}.png"
+        save_path = os.path.join(output_path, file_name)
+        plt.savefig(save_path, bbox_inches='tight', dpi=150)
+        plt.close()
+
+    # t-SNE
     tsne = TSNE(n_components=2, random_state=42, perplexity=50)
-    latents_2d = tsne.fit_transform(latents)
+    latents_tsne = tsne.fit_transform(latents)
+    plot(latents_tsne, method_name="tsne")
 
-    class_labels = get_class_labels(descriptor) 
-    n_classes = len(class_labels)
-    colors = generate_colors(n_classes)
+    # PCA
+    pca = PCA(n_components=2)
+    latents_pca = pca.fit_transform(latents)
+    plot(latents_pca, method_name="pca")
 
-    fig_width = 8
-    legend_width = 3
-    fig_height = 8
-    sns.set_style("whitegrid")
-    plt.rcParams['axes.facecolor'] = (0.85, 0.9, 1, 0.25)
-    fig = plt.figure(figsize=(fig_width + legend_width, fig_height))
-    ax = fig.add_axes([0, 0, fig_width / (fig_width + legend_width), 1])
-
-    for idx, label in enumerate(class_labels):
-        indices = np.where(true_labels == idx)[0]
-        ax.scatter(latents_2d[indices, 0], latents_2d[indices, 1], label=label,
-                   alpha=0.9, s=70, edgecolors='white', color=colors[idx])
-
-    ax.set_title(f"Latent Space - {descriptor}")
-    ax.set_xlabel('t-SNE dim 1')
-    ax.set_ylabel('t-SNE dim 2')
-
-    x_min, x_max = latents_2d[:, 0].min(), latents_2d[:, 0].max()
-    y_min, y_max = latents_2d[:, 1].min(), latents_2d[:, 1].max()
-    max_range = max(x_max - x_min, y_max - y_min)
-    x_mid = (x_max + x_min) / 2
-    y_mid = (y_max + y_min) / 2
-
-    ax.set_xlim(x_mid - max_range / 2, x_mid + max_range / 2)
-    ax.set_ylim(y_mid - max_range / 2, y_mid + max_range / 2)
-    ax.set_aspect('equal', adjustable='box')
-    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize='small', frameon=False)
-
-    os.makedirs(output_path, exist_ok=True)
-    save_path = os.path.join(output_path, f"{filename_prefix}_{descriptor}.png")
-    plt.savefig(save_path, bbox_inches='tight', dpi=150)
-    plt.close()
-
-    wandb.log({f"Latent space {descriptor}": wandb.Image(save_path)})
