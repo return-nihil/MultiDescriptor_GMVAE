@@ -76,7 +76,7 @@ losses:
   recon_lambda: 10.0
   kl_lambda: 0.0025
   class_lambda: 0.25
-  class_weigths: {timbre: 2, pitch: 1, velocity: 1, duration: 1}
+  class_weigths: {timbre: 3, pitch: 1, velocity: 1, duration: 1}
   rem_lambda: 0.025
   rem_kl_lambda: 0.00001
 
@@ -88,7 +88,7 @@ train:
   beta_warmup: 100
   pretrain_no_removers: 200
   scheduler_patience: 30
-  early_stopping_patience: 100
+  early_stopping_patience: 70
   output_folder_name: 'outputs'
   logs: True
 

@@ -47,6 +47,17 @@ class KL_Emb_Loss(nn.Module):
             (torch.exp(logvar) + (mu - prior_mu) ** 2) / torch.exp(prior_logvar) - 1
         )
         return torch.sum(kl, dim=1) * self.kl_lambda
+    
+
+class LatentSpreadLoss(nn.Module):
+    '''Enforce latent spread by minimizing variance'''
+    def __init__(self, lambda_spread=1e-3):
+        super().__init__()
+        self.lambda_spread = lambda_spread
+
+    def forward(self, z):
+        var = torch.var(z, dim=0).mean()
+        return -var * self.lambda_spread
 
 
 class Classifier_Loss(nn.Module):

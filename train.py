@@ -50,6 +50,7 @@ def train(model,
         lr, 
         recon_loss_fn,
         kl_emb_loss_fn,
+        spread_loss_fn,
         classifier_loss_fn,
         remover_loss_fn,
         remover_kl_loss_fn,
@@ -88,6 +89,7 @@ def train(model,
 
             total_loss = 0
             total_recon = 0
+            total_spread_loss = 0
             total_removers_KL_loss = 0
             total_removers_loss = 0
     
@@ -112,16 +114,19 @@ def train(model,
                 recon_loss = recon_loss_fn(x_predict, spectrogram)
 
                 kl_losses = {}
+                spread_losses = {}
                 class_losses = {}
                 loss_totals = {f'total_{desc}_kld': 0 for desc in descriptors}
                 loss_totals.update({f'total_{desc}_loss': 0 for desc in descriptors})
-                
+
                 for desc in descriptors:
                     kl_losses[desc] = kl_emb_loss_fn(
                         model.mu_lookup[desc], model.logvar_lookup[desc], 
                         latents[desc]['mu'], latents[desc]['logvar'], 
                         target_classes[desc]
                     )
+
+                    spread_losses[desc] = spread_loss_fn(latents[desc]['z'])
                     
                     class_pred = classifiers[desc](latents[desc]['z'])
                     class_losses[desc] = classifier_loss_fn(class_pred, target_classes[desc])
@@ -129,6 +134,7 @@ def train(model,
                 beta = epoch/beta_warmup if epoch < beta_warmup else 1
                 total_loss = (recon_loss + 
                             beta * sum(kl_losses[desc].mean() for desc in descriptors) +
+                            sum(spread_losses[desc] for desc in descriptors) +
                             sum(class_losses[desc] for desc in descriptors))
 
                 remover_inputs = {
@@ -157,6 +163,7 @@ def train(model,
 
                 total_loss += first_loss.item()
                 total_recon += recon_loss.item()
+                total_spread_loss += sum(spread_losses[desc].item() for desc in descriptors)
                 
                 for desc in descriptors:
                     loss_totals[f'total_{desc}_kld'] += kl_losses[desc].sum().item()
@@ -200,7 +207,7 @@ def train(model,
                 if total_loss < best_loss:
                     best_loss = total_loss
                     print("[MODEL] Saving...")
-                    torch.save(model.state_dict(), os.path.join(thisdir, OUTPUT_FOLDER, 'MD_GMVAE_.pth'))
+                    torch.save(model.state_dict(), os.path.join(thisdir, OUTPUT_FOLDER, 'MD_GMVAE.pth'))
                 early_stopping(total_loss / len(dataloaders[phase]))
 
             if early_stopping.early_stop:
@@ -211,6 +218,7 @@ def train(model,
                 log_dict = {
                     f"{phase}/global_loss": total_loss / len(dataloaders[phase]),
                     f"{phase}/reconstruction_loss": total_recon / len(dataloaders[phase]),
+                    f"{phase}/spread_loss": total_spread_loss / len(dataloaders[phase]),
                     f"{phase}/remover_KL_loss": total_removers_KL_loss / len(dataloaders[phase]),
                     f"{phase}/remover_loss": total_removers_loss / len(dataloaders[phase]),
                 }
@@ -234,7 +242,7 @@ def test(model,
          kl_emb_loss_fn, 
          classifier_loss_fn):
     model.to(device)
-    model.load_state_dict(torch.load(os.path.join(thisdir, OUTPUT_FOLDER, 'MD_GMVAE_.pth')))
+    model.load_state_dict(torch.load(os.path.join(thisdir, OUTPUT_FOLDER, 'MD_GMVAE.pth')))
     model.eval()
     phase = 'test'
     
@@ -325,7 +333,6 @@ def test(model,
             plot_confusion_matrix(
                 confusion,
                 descriptor=desc,
-                true_labels=all_true[desc],
                 output_path=os.path.join(thisdir, OUTPUT_FOLDER)
             )
 
@@ -333,7 +340,8 @@ def test(model,
                 all_latents[desc],
                 all_true[desc],
                 descriptor=desc,
-                output_path=os.path.join(thisdir, OUTPUT_FOLDER)
+                output_path=os.path.join(thisdir, OUTPUT_FOLDER),
+                filename_prefix="test_latents"
             )
 
             print(f"{desc} accuracy: {accuracy:.4f}, f1: {f1:.4f}")
@@ -344,7 +352,6 @@ def test(model,
 
 
 
-        
         
 def main():
     '''Main function to train and test the model'''
@@ -398,6 +405,7 @@ def main():
 
     recon_loss_fn = Reconstruction_Loss()
     kl_emb_loss_fn = KL_Emb_Loss()
+    spread_loss_fn = LatentSpreadLoss()
     classifier_loss_fn = Classifier_Loss()
     remover_loss_fn = Remover_Loss()
     remover_kl_loss_fn = Remover_KL_Uniform_Loss()
@@ -410,6 +418,7 @@ def main():
             lr=lr, 
             recon_loss_fn=recon_loss_fn,
             kl_emb_loss_fn=kl_emb_loss_fn,
+            spread_loss_fn=spread_loss_fn,
             classifier_loss_fn=classifier_loss_fn,
             remover_loss_fn=remover_loss_fn,
             remover_kl_loss_fn=remover_kl_loss_fn,
@@ -426,6 +435,37 @@ def main():
          kl_emb_loss_fn=kl_emb_loss_fn, 
          classifier_loss_fn=classifier_loss_fn)
 
+
+    print("Extracting latents from full dataset and plotting t-SNEs...")
+    full_dataloader = DataLoader(tinysol_dataset, batch_size=bs, shuffle=False, drop_last=False, num_workers=4)
+
+    descriptors = ['timbre', 'pitch', 'velocity', 'duration']
+    all_latents = {desc: [] for desc in descriptors}
+    all_labels = {desc: [] for desc in descriptors}
+
+    model.eval()
+    for S, T, P, V, D in tqdm(full_dataloader):
+        S = S.to(device)
+        labels = {'timbre': T, 'pitch': P, 'velocity': V, 'duration': D}
+
+        with torch.no_grad():
+            _, latents = model(S)
+
+        for desc in descriptors:
+            all_latents[desc].append(latents[desc]['z'].cpu().numpy())
+            all_labels[desc].append(labels[desc].numpy())
+
+    for desc in descriptors:
+        latents_np = np.concatenate(all_latents[desc], axis=0)
+        labels_np = np.concatenate(all_labels[desc], axis=0)
+
+        plot_latent_space(
+            latents=latents_np,
+            true_labels=labels_np,
+            descriptor=desc,
+            output_path=os.path.join(thisdir, OUTPUT_FOLDER),
+            filename_prefix="all_latents"
+        )
 
     if LOGS:
         wandb.finish()
